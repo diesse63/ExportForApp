@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import gpxpy
 import gpxpy.gpx
 from simplification.cutil import simplify_coords
-from garminconnect import Garmin
+from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
 import io
 
 # --- FUNZIONI DI ELABORAZIONE ---
@@ -50,41 +50,52 @@ def extract_track_data(gpx_content, epsilon=0.00005):
         return json.dumps(pts_final), json.dumps(alti), int(up)
     except: return None, None, 0
 
-# --- INTERFACCIA WEB (STREAMLIT) ---
-st.set_page_config(page_title="Garmin Exporter", page_icon="🏃‍♂️")
+# --- INTERFACCIA STREAMLIT ---
+st.set_page_config(page_title="Garmin Exporter 2026", page_icon="🏃‍♂️")
 
 st.title("🏃‍♂️ Garmin Activity Exporter")
-st.write("Inserisci le tue credenziali Garmin Connect per generare il file `export_app.json`.")
 
-# Input Utente
+if 'client' not in st.session_state:
+    st.session_state.client = None
+
+# Sidebar per credenziali
 with st.sidebar:
-    st.header("Login")
-    user_email = st.text_input("Email Garmin Connect")
-    user_password = st.text_input("Password", type="password")
+    st.header("1. Accesso")
+    email = st.text_input("Email Garmin Connect")
+    password = st.text_input("Password", type="password")
+    mfa_code = st.text_input("Codice MFA (se richiesto)", help="Inserisci il codice ricevuto via SMS/Email")
+    
     st.divider()
+    st.header("2. Impostazioni")
     block_size = st.number_input("Attività per blocco", value=50)
-    epsilon_val = st.number_input("Epsilon (Semplificazione)", value=0.00005, format="%.5f")
+    epsilon_val = st.number_input("Semplificazione (Epsilon)", value=0.00005, format="%.5f")
 
-if st.button("🚀 Avvia Esportazione Totale"):
-    if not user_email or not user_password:
-        st.error("Inserisci email e password per continuare.")
+# Bottone principale
+if st.button("🚀 Avvia Esportazione"):
+    if not email or not password:
+        st.error("Inserisci email e password.")
     else:
         try:
-            client = Garmin(user_email, user_password)
-            with st.spinner("Accesso a Garmin in corso..."):
-                client.login()
+            # Tenta il login
+            client = Garmin(email, password)
             
-            st.success("Login effettuato con successo!")
+            with st.spinner("Autenticazione in corso..."):
+                if mfa_code:
+                    # Se l'utente ha inserito il codice MFA
+                    client.login(mfa_code)
+                else:
+                    # Tenta il login normale
+                    client.login()
             
+            st.success("Login effettuato!")
+            
+            # PROCESSO DI SCARICAMENTO
             all_records = []
             start_index = 0
-            
-            # Placeholder per aggiornamenti in tempo reale
             status_text = st.empty()
-            progress_bar = st.progress(0)
             
             while True:
-                status_text.info(f"Recupero attività da {start_index} a {start_index + block_size}...")
+                status_text.info(f"Recupero blocco attività da {start_index}...")
                 activities = client.get_activities(start_index, block_size)
                 
                 if not activities:
@@ -93,16 +104,12 @@ if st.button("🚀 Avvia Esportazione Totale"):
                 for act in activities:
                     act_id = str(act.get("activityId", ""))
                     try:
-                        # Parsing dati base
+                        # Dati temporali
                         raw_date_gmt = act.get("startTimeGMT") 
                         dt_obj = datetime.strptime(raw_date_gmt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                         unix_timestamp = int(dt_obj.timestamp())
                         
-                        total_seconds = act.get("duration", 0)
-                        dur_h = int(total_seconds // 3600)
-                        dur_m = int((total_seconds % 3600) // 60)
-                        
-                        # Download traccia
+                        # Download e conversione
                         raw = client.download_activity(act_id)
                         content = raw.encode("utf-8") if isinstance(raw, str) else raw
                         if b"TrainingCenterDatabase" in content:
@@ -117,30 +124,29 @@ if st.button("🚀 Avvia Esportazione Totale"):
                                 "Data": unix_timestamp,
                                 "Lunghezza": round(act.get("distance", 0) / 1000.0, 2),
                                 "Dislivello": int(act.get("elevationGain", 0)) or gpx_gain,
-                                "Durata": f"{dur_h}h {dur_m}m",
+                                "Durata": f"{int(act.get('duration', 0)//3600)}h {int((act.get('duration', 0)%3600)//60)}m",
                                 "CoordLight": coord_json,
                                 "Altimetria": alti_json
                             })
-                    except Exception as e:
-                        st.warning(f"Errore sull'attività {act_id}: {e}")
+                    except:
+                        continue
                 
                 start_index += block_size
-                time.sleep(2) # Pausa per non essere bloccati da Garmin
-            
-            # Preparazione file finale
-            all_records.sort(key=lambda x: x.get('Data', 0), reverse=True)
-            json_string = json.dumps(all_records, indent=4, ensure_ascii=False)
-            
-            st.balloons()
-            st.success(f"Finito! {len(all_records)} attività elaborate.")
-            
-            # Pulsante di Download
-            st.download_button(
-                label="📥 SCARICA EXPORT_APP.JSON",
-                data=json_string,
-                file_name="export_app.json",
-                mime="application/json"
-            )
+                time.sleep(2)
+
+            if all_records:
+                all_records.sort(key=lambda x: x.get('Data', 0), reverse=True)
+                json_string = json.dumps(all_records, indent=4, ensure_ascii=False)
+                st.balloons()
+                st.download_button("📥 SCARICA EXPORT_APP.JSON", json_string, "export_app.json", "application/json")
+            else:
+                st.warning("Nessuna attività trovata con traccia GPS.")
 
         except Exception as e:
-            st.error(f"Errore critico: {e}. Controlla le credenziali o se l'account ha l'autenticazione a due fattori attiva.")
+            error_msg = str(e)
+            if "MFA" in error_msg or "401" in error_msg:
+                st.error("Garmin richiede l'autenticazione a due fattori (MFA). Controlla la tua email o SMS, inserisci il codice nel campo a sinistra e premi di nuovo 'Avvia Esportazione'.")
+            elif "Too Many Requests" in error_msg:
+                st.error("Troppe richieste. Attendi 10 minuti e riprova.")
+            else:
+                st.error(f"Errore: {error_msg}")
