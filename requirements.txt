@@ -2,3 +2,4 @@ garminconnect
 gpxpy
 simplification
 streamlit
+pytz

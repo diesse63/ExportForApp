@@ -3,23 +3,32 @@ import json
 import time
 import os
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import gpxpy
 import gpxpy.gpx
 from simplification.cutil import simplify_coords
 from garminconnect import Garmin
-import io
 
-# --- FUNZIONE LOG PER STREAMLIT ---
+# --- CONFIGURAZIONE INTERFACCIA ---
+st.set_page_config(page_title="DIESSE - Garmin Exporter", page_icon="🚴‍♂️", layout="wide")
+
+# Funzione interna per il calcolo del codice segreto (Mezzanotte Italia UTC+1)
+def _get_internal_verification_code():
+    now_utc = datetime.now(timezone.utc)
+    italy_now = now_utc + timedelta(hours=1)
+    midnight = datetime(italy_now.year, italy_now.month, italy_now.day, 0, 0, 0)
+    return str(int(midnight.timestamp()))
+
+# Funzione per aggiornare il log nella finestra scorrevole
 def update_log(message, log_placeholder):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    new_log = f"[{timestamp}] {message}"
-    if 'log_text' not in st.session_state:
-        st.session_state.log_text = ""
-    st.session_state.log_text += new_log + "\n"
-    log_placeholder.code(st.session_state.log_text)
+    new_line = f"[{timestamp}] {message}"
+    if 'log_lines' not in st.session_state:
+        st.session_state.log_lines = []
+    st.session_state.log_lines.append(new_line)
+    log_placeholder.code("\n".join(st.session_state.log_lines))
 
-# --- FUNZIONI DI ELABORAZIONE ---
+# --- LOGICA DI ELABORAZIONE TRACCE ---
 def tcx_to_gpx_in_memory(tcx_bytes):
     try:
         text = tcx_bytes.decode("utf-8", errors="ignore")
@@ -60,112 +69,111 @@ def extract_track_data(gpx_content, epsilon=0.00005):
         return json.dumps(pts_final), json.dumps(alti), int(up)
     except: return None, None, 0
 
-# --- INTERFACCIA STREAMLIT ---
-st.set_page_config(page_title="DIESSE - Garmin Exporter", page_icon="🚴‍♂️", layout="wide")
-
-# Inizializza log nella sessione
-if 'log_text' not in st.session_state:
-    st.session_state.log_text = ""
+# --- LAYOUT APP ---
+if 'log_lines' not in st.session_state:
+    st.session_state.log_lines = []
 
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    # Inserimento Immagine DIESSE
+    # Mostra Logo DIESSE (cerca logo.jpg nella cartella principale)
     if os.path.exists("logo.jpg"):
         st.image("logo.jpg", use_container_width=True)
     else:
         st.title("DIESSE")
-        st.info("Immagine 'logo.jpg' non trovata nel repository.")
-
-    st.header("Configurazione")
+    
+    st.subheader("Parametri di Accesso")
     email = st.text_input("Email Garmin Connect")
     password = st.text_input("Password", type="password")
-    mfa_code = st.text_input("Codice MFA (se richiesto)", help="Controlla SMS o Email")
-    st.divider()
-    block_size = st.number_input("Attività per blocco", value=50)
-    epsilon_val = st.number_input("Semplificazione (Epsilon)", value=0.00005, format="%.5f")
+    mfa = st.text_input("Codice MFA (se richiesto)")
     
-    start_btn = st.button("🚀 Avvia Esportazione", use_container_width=True)
-    if st.button("Pulisci Log"):
-        st.session_state.log_text = ""
+    # Campo per il codice di sicurezza (Unix Timestamp generato dall'app MIT)
+    codice_diesse = st.text_input("Codice di conferma", type="password")
+    
+    st.divider()
+    block_size = st.slider("Attività per blocco", 10, 100, 50)
+    
+    btn_start = st.button("🚀 AVVIA ESPORTAZIONE", use_container_width=True)
+    if st.button("Pulisci Console Log"):
+        st.session_state.log_lines = []
         st.rerun()
 
 with col2:
-    st.header("Console Log")
-    log_placeholder = st.empty()
-    log_placeholder.code(st.session_state.log_text)
+    st.subheader("Console Log")
+    # Finestra scorrevole con altezza fissa
+    with st.container(height=600, border=True):
+        console_area = st.empty()
+        console_area.code("\n".join(st.session_state.log_lines))
 
-if start_btn:
-    if not email or not password:
-        st.error("Inserisci le credenziali!")
+# --- ESECUZIONE ---
+if btn_start:
+    # Verifica Codice di Sicurezza (Nessun aiuto visualizzato in caso di errore)
+    if codice_diesse != _get_internal_verification_code():
+        update_log("❌ ERRORE: Accesso negato. Codice di conferma non valido.", console_area)
+        st.error("Codice di conferma non valido.")
+    elif not email or not password:
+        st.error("Inserire email e password Garmin.")
     else:
         try:
-            st.session_state.log_text = ""
-            update_log("Tentativo di login in corso...", log_placeholder)
+            st.session_state.log_lines = [] # Reset log all'avvio
+            update_log("Verifica completata. Connessione a Garmin Connect...", console_area)
             
             client = Garmin(email, password)
-            if mfa_code:
-                client.login(mfa_code)
+            if mfa:
+                client.login(mfa)
             else:
                 client.login()
             
-            update_log("✅ Login effettuato con successo.", log_placeholder)
+            update_log("✅ Login effettuato. Inizio recupero dati...", console_area)
             
             all_records = []
-            start_index = 0
-            
+            idx = 0
             while True:
-                update_log(f"Richiesta blocco da indice {start_index}...", log_placeholder)
-                activities = client.get_activities(start_index, block_size)
-                
+                update_log(f"Richiesta blocco attività (indice: {idx})...", console_area)
+                activities = client.get_activities(idx, block_size)
                 if not activities:
-                    update_log("🏁 Fine attività trovate.", log_placeholder)
                     break
                 
                 for act in activities:
-                    act_id = str(act.get("activityId", ""))
+                    act_id = str(act.get("activityId"))
                     tipo = act.get("activityType", {}).get("typeKey", "hiking")
-                    data_str = act.get("startTimeLocal")
-                    
-                    update_log(f"Processo: {act_id} | {tipo} | {data_str}", log_placeholder)
+                    update_log(f"-> Elaborazione attività: {act_id} ({tipo})", console_area)
                     
                     try:
-                        raw_date_gmt = act.get("startTimeGMT") 
-                        dt_obj = datetime.strptime(raw_date_gmt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                        unix_timestamp = int(dt_obj.timestamp())
-                        
                         raw = client.download_activity(act_id)
                         content = raw.encode("utf-8") if isinstance(raw, str) else raw
                         if b"TrainingCenterDatabase" in content:
                             content = tcx_to_gpx_in_memory(content)
                         
-                        coord_json, alti_json, gpx_gain = extract_track_data(content, epsilon_val)
+                        coords, alti, gain = extract_track_data(content)
                         
-                        if coord_json:
+                        if coords:
+                            raw_date = act.get("startTimeGMT")
+                            dt = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                             all_records.append({
                                 "NomeFile": act_id,
                                 "TipoPercorso": tipo,
-                                "Data": unix_timestamp,
+                                "Data": int(dt.timestamp()),
                                 "Lunghezza": round(act.get("distance", 0) / 1000.0, 2),
-                                "Dislivello": int(act.get("elevationGain", 0)) or gpx_gain,
-                                "Durata": f"{int(act.get('duration', 0)//3600)}h {int((act.get('duration', 0)%3600)//60)}m",
-                                "CoordLight": coord_json,
-                                "Altimetria": alti_json
+                                "Dislivello": int(act.get("elevationGain", 0)) or gain,
+                                "Durata": f"{int(act.get('duration')//3600)}h {int((act.get('duration')%3600)//60)}m",
+                                "CoordLight": coords,
+                                "Altimetria": alti
                             })
                     except:
                         continue
-                
-                start_index += block_size
-                time.sleep(2)
+                idx += block_size
+                time.sleep(1)
 
             if all_records:
-                update_log(f"Salvataggio di {len(all_records)} attività...", log_placeholder)
-                all_records.sort(key=lambda x: x.get('Data', 0), reverse=True)
-                json_string = json.dumps(all_records, indent=4, ensure_ascii=False)
+                all_records.sort(key=lambda x: x['Data'], reverse=True)
+                json_out = json.dumps(all_records, indent=4, ensure_ascii=False)
+                update_log(f"✅ Esportazione completata: {len(all_records)} attività processate.", console_area)
+                st.success("File pronto per il download.")
+                st.download_button("📥 SCARICA EXPORT_APP.JSON", json_out, "export_app.json", "application/json", use_container_width=True)
+            else:
+                update_log("⚠️ Nessuna attività con traccia GPS trovata.", console_area)
                 
-                st.success(f"Completato! Scaricate {len(all_records)} attività.")
-                st.download_button("📥 SCARICA EXPORT_APP.JSON", json_string, "export_app.json", "application/json")
-            
         except Exception as e:
-            update_log(f"ERRORE: {str(e)}", log_placeholder)
-            st.error(f"Errore: {e}")
+            update_log(f"❌ ERRORE CRITICO: {str(e)}", console_area)
+            st.error("Si è verificato un errore durante la connessione o lo scaricamento.")
