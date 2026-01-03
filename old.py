@@ -9,6 +9,17 @@ from simplification.cutil import simplify_coords
 from garminconnect import Garmin
 import io
 
+# --- FUNZIONE LOG PER STREAMLIT ---
+def update_log(message, log_placeholder):
+    """Aggiunge una riga al log visualizzato nell'app"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    new_log = f"[{timestamp}] {message}"
+    if 'log_text' not in st.session_state:
+        st.session_state.log_text = ""
+    st.session_state.log_text += new_log + "\n"
+    # Visualizza le ultime 15 righe per non allungare troppo la pagina
+    log_placeholder.code(st.session_state.log_text)
+
 # --- FUNZIONI DI ELABORAZIONE ---
 def tcx_to_gpx_in_memory(tcx_bytes):
     try:
@@ -50,59 +61,78 @@ def extract_track_data(gpx_content, epsilon=0.00005):
         return json.dumps(pts_final), json.dumps(alti), int(up)
     except: return None, None, 0
 
-# --- INTERFACCIA WEB (STREAMLIT) ---
-st.set_page_config(page_title="Garmin Exporter", page_icon="🏃‍♂️")
+# --- INTERFACCIA STREAMLIT ---
+st.set_page_config(page_title="Garmin Exporter 2026", page_icon="🏃‍♂️", layout="wide")
 
-st.title("🏃‍♂️ Garmin Activity Exporter")
-st.write("Inserisci le tue credenziali Garmin Connect per generare il file `export_app.json`.")
+st.title("🏃‍♂️ Garmin Activity Exporter & Logger")
 
-# Input Utente
-with st.sidebar:
-    st.header("Login")
-    user_email = st.text_input("Email Garmin Connect")
-    user_password = st.text_input("Password", type="password")
+# Inizializza log nella sessione
+if 'log_text' not in st.session_state:
+    st.session_state.log_text = ""
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.header("1. Configurazione")
+    email = st.text_input("Email Garmin Connect")
+    password = st.text_input("Password", type="password")
+    mfa_code = st.text_input("Codice MFA (se richiesto)", help="Controlla SMS o Email")
     st.divider()
     block_size = st.number_input("Attività per blocco", value=50)
-    epsilon_val = st.number_input("Epsilon (Semplificazione)", value=0.00005, format="%.5f")
+    epsilon_val = st.number_input("Semplificazione (Epsilon)", value=0.00005, format="%.5f")
+    
+    start_btn = st.button("🚀 Avvia Esportazione", use_container_width=True)
+    if st.button("Clear Log"):
+        st.session_state.log_text = ""
+        st.rerun()
 
-if st.button("🚀 Avvia Esportazione Totale"):
-    if not user_email or not user_password:
-        st.error("Inserisci email e password per continuare.")
+with col2:
+    st.header("2. Console Log")
+    log_placeholder = st.empty()
+    # Mostra log esistente se presente
+    log_placeholder.code(st.session_state.log_text)
+
+if start_btn:
+    if not email or not password:
+        st.error("Inserisci le credenziali!")
     else:
         try:
-            client = Garmin(user_email, user_password)
-            with st.spinner("Accesso a Garmin in corso..."):
+            st.session_state.log_text = "" # Reset log ad ogni avvio
+            update_log("Tentativo di login in corso...", log_placeholder)
+            
+            client = Garmin(email, password)
+            if mfa_code:
+                client.login(mfa_code)
+            else:
                 client.login()
             
-            st.success("Login effettuato con successo!")
+            update_log("✅ Login effettuato con successo.", log_placeholder)
             
             all_records = []
             start_index = 0
             
-            # Placeholder per aggiornamenti in tempo reale
-            status_text = st.empty()
-            progress_bar = st.progress(0)
-            
             while True:
-                status_text.info(f"Recupero attività da {start_index} a {start_index + block_size}...")
+                update_log(f"Richiesta blocco attività da indice {start_index}...", log_placeholder)
                 activities = client.get_activities(start_index, block_size)
                 
                 if not activities:
+                    update_log("🏁 Nessun'altra attività trovata.", log_placeholder)
                     break
                 
                 for act in activities:
                     act_id = str(act.get("activityId", ""))
+                    tipo = act.get("activityType", {}).get("typeKey", "hiking")
+                    data_str = act.get("startTimeLocal")
+                    
+                    update_log(f"Elaborazione: {act_id} | {tipo} | {data_str}", log_placeholder)
+                    
                     try:
                         # Parsing dati base
                         raw_date_gmt = act.get("startTimeGMT") 
                         dt_obj = datetime.strptime(raw_date_gmt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                         unix_timestamp = int(dt_obj.timestamp())
                         
-                        total_seconds = act.get("duration", 0)
-                        dur_h = int(total_seconds // 3600)
-                        dur_m = int((total_seconds % 3600) // 60)
-                        
-                        # Download traccia
+                        # Download
                         raw = client.download_activity(act_id)
                         content = raw.encode("utf-8") if isinstance(raw, str) else raw
                         if b"TrainingCenterDatabase" in content:
@@ -113,34 +143,32 @@ if st.button("🚀 Avvia Esportazione Totale"):
                         if coord_json:
                             all_records.append({
                                 "NomeFile": act_id,
-                                "TipoPercorso": act.get("activityType", {}).get("typeKey", "hiking"),
+                                "TipoPercorso": tipo,
                                 "Data": unix_timestamp,
                                 "Lunghezza": round(act.get("distance", 0) / 1000.0, 2),
                                 "Dislivello": int(act.get("elevationGain", 0)) or gpx_gain,
-                                "Durata": f"{dur_h}h {dur_m}m",
+                                "Durata": f"{int(act.get('duration', 0)//3600)}h {int((act.get('duration', 0)%3600)//60)}m",
                                 "CoordLight": coord_json,
                                 "Altimetria": alti_json
                             })
+                            # update_log(f"   -> OK: Salvata.", log_placeholder)
+                        else:
+                            update_log(f"   -> ⚠️ Salto: Nessuna traccia GPS.", log_placeholder)
                     except Exception as e:
-                        st.warning(f"Errore sull'attività {act_id}: {e}")
+                        update_log(f"   -> ❌ Errore attività {act_id}: {e}", log_placeholder)
                 
                 start_index += block_size
-                time.sleep(2) # Pausa per non essere bloccati da Garmin
-            
-            # Preparazione file finale
-            all_records.sort(key=lambda x: x.get('Data', 0), reverse=True)
-            json_string = json.dumps(all_records, indent=4, ensure_ascii=False)
-            
-            st.balloons()
-            st.success(f"Finito! {len(all_records)} attività elaborate.")
-            
-            # Pulsante di Download
-            st.download_button(
-                label="📥 SCARICA EXPORT_APP.JSON",
-                data=json_string,
-                file_name="export_app.json",
-                mime="application/json"
-            )
+                update_log(f"Pausa di sicurezza... (Attese {len(all_records)} attività totali)", log_placeholder)
+                time.sleep(2)
 
+            if all_records:
+                update_log(f"Sorting di {len(all_records)} attività...", log_placeholder)
+                all_records.sort(key=lambda x: x.get('Data', 0), reverse=True)
+                json_string = json.dumps(all_records, indent=4, ensure_ascii=False)
+                
+                st.success(f"Completato! Scaricate {len(all_records)} attività.")
+                st.download_button("📥 SCARICA EXPORT_APP.JSON", json_string, "export_app.json", "application/json")
+            
         except Exception as e:
-            st.error(f"Errore critico: {e}. Controlla le credenziali o se l'account ha l'autenticazione a due fattori attiva.")
+            update_log(f"CRITICAL ERROR: {str(e)}", log_placeholder)
+            st.error(f"Errore: {e}")
